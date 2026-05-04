@@ -8,10 +8,10 @@
 import SwiftUI
 
 @main
-struct lazeelog_codexApp: App {
+struct LazeeLogApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            TimerScreen(viewModel: TimerViewModel())
         }
     }
 }
