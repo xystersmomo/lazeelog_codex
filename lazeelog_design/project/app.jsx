@@ -1,0 +1,1675 @@
+// LazeeLog — interactive timer app prototype
+// Renders inside an IOSDevice frame. Single-file but composed of small components.
+
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─────────────────────────────────────────────────────────────
+// Design tokens
+// ─────────────────────────────────────────────────────────────
+const TOKENS = {
+  bg: '#000000',
+  bgElev: '#0d0d0f',
+  surface: 'rgba(255,255,255,0.04)',
+  surfaceHi: 'rgba(255,255,255,0.08)',
+  border: 'rgba(255,255,255,0.06)',
+  borderHi: 'rgba(255,255,255,0.12)',
+  text: '#ffffff',
+  textDim: 'rgba(235,235,245,0.6)',
+  textFaint: 'rgba(235,235,245,0.3)',
+  font: '-apple-system, "SF Pro Display", "SF Pro", system-ui, sans-serif',
+  mono: '"SF Mono", "SFMono-Regular", ui-monospace, Menlo, monospace',
+};
+
+// Category palette — distinct colors for tasks vs. distractions
+const CATS = {
+  // productive (warm, saturated)
+  design:  { name: 'Design',   color: '#FF9F0A', kind: 'work' },
+  code:    { name: 'Code',     color: '#30D158', kind: 'work' },
+  writing: { name: 'Writing',  color: '#5E5CE6', kind: 'work' },
+  meeting: { name: 'Meeting',  color: '#64D2FF', kind: 'work' },
+  reading: { name: 'Reading',  color: '#BF5AF2', kind: 'work' },
+  // distractions (muted reds/grays)
+  social:  { name: 'Social',   color: '#FF453A', kind: 'distract' },
+  video:   { name: 'Video',    color: '#FF6482', kind: 'distract' },
+  shopping:{ name: 'Shopping', color: '#FF9500', kind: 'distract' },
+};
+
+// ─────────────────────────────────────────────────────────────
+// Sample data — today's sessions + 7-week history
+// ─────────────────────────────────────────────────────────────
+function makeHistory() {
+  // 91 days (13 weeks × 7) of pseudo-random sessions per category
+  const days = [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const seed = (n) => {
+    let x = Math.sin(n) * 10000;
+    return x - Math.floor(x);
+  };
+  for (let i = 90; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const sessions = {};
+    Object.keys(CATS).forEach((k, idx) => {
+      const r = seed(i * 13 + idx * 7);
+      // sparser on weekends, more activity in recent weeks
+      const weekend = d.getDay() === 0 || d.getDay() === 6;
+      const recency = 1 - i / 120;
+      let p = (CATS[k].kind === 'work' ? 0.55 : 0.35) * recency;
+      if (weekend && CATS[k].kind === 'work') p *= 0.4;
+      if (r < p) {
+        // minutes 5–120
+        sessions[k] = Math.round(5 + seed(i * 31 + idx) * 115);
+      }
+    });
+    days.push({ date: d, sessions });
+  }
+  return days;
+}
+
+const HISTORY = makeHistory();
+
+const TODAY_SESSIONS = [
+  { id: 1, cat: 'meeting', label: 'Standup',           start: '09:00', mins: 22 },
+  { id: 2, cat: 'code',    label: 'API refactor',      start: '09:35', mins: 78 },
+  { id: 3, cat: 'social',  label: 'Twitter',           start: '11:02', mins: 14 },
+  { id: 4, cat: 'design',  label: 'Onboarding mocks',  start: '11:30', mins: 52 },
+  { id: 5, cat: 'video',   label: 'YouTube',           start: '13:10', mins: 23 },
+  { id: 6, cat: 'writing', label: 'Spec doc',          start: '14:00', mins: 41 },
+  { id: 7, cat: 'code',    label: 'Bug fixes',         start: '15:15', mins: 64 },
+  { id: 8, cat: 'reading', label: 'API docs',          start: '16:30', mins: 18 },
+];
+
+// ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+const fmtClock = (sec) => {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return [h, m, s].map((v) => String(v).padStart(2, '0')).join(':');
+};
+const fmtDur = (mins) => {
+  if (mins < 60) return `${mins}m`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m ? `${h}h ${m}m` : `${h}h`;
+};
+
+// Tiny SF-ish icons
+const Icon = {
+  play: (c = '#fff', s = 22) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <path d="M8 5.5v13l11-6.5L8 5.5z" fill={c}/>
+    </svg>
+  ),
+  pause: (c = '#fff', s = 22) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <rect x="7" y="5" width="3.6" height="14" rx="1.2" fill={c}/>
+      <rect x="13.4" y="5" width="3.6" height="14" rx="1.2" fill={c}/>
+    </svg>
+  ),
+  stop: (c = '#fff', s = 18) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <rect x="6" y="6" width="12" height="12" rx="2" fill={c}/>
+    </svg>
+  ),
+  check: (c = '#fff', s = 14) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <path d="M5 12.5l4.5 4.5L19 7.5" stroke={c} strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  ),
+  clock: (c = '#fff', s = 14) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="9" stroke={c} strokeWidth="1.8"/>
+      <path d="M12 7v5.5l3.5 2" stroke={c} strokeWidth="1.8" strokeLinecap="round"/>
+    </svg>
+  ),
+  chevDown: (c = '#fff', s = 16) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <path d="M6 9l6 6 6-6" stroke={c} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  ),
+  grid: (c = '#fff', s = 18) => (
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none">
+      <rect x="3" y="3" width="7" height="7" rx="1.5" fill={c}/>
+      <rect x="14" y="3" width="7" height="7" rx="1.5" fill={c}/>
+      <rect x="3" y="14" width="7" height="7" rx="1.5" fill={c}/>
+      <rect x="14" y="14" width="7" height="7" rx="1.5" fill={c} opacity="0.4"/>
+    </svg>
+  ),
+};
+
+// ─────────────────────────────────────────────────────────────
+// Category picker (small horizontal pill list)
+// ─────────────────────────────────────────────────────────────
+function CategoryPills({ value, onChange }) {
+  return (
+    <div style={{
+      display: 'flex', gap: 8, overflowX: 'auto', padding: '0 24px',
+      scrollbarWidth: 'none',
+    }}>
+      {Object.entries(CATS).map(([key, c]) => {
+        const active = value === key;
+        return (
+          <button
+            key={key}
+            onClick={() => onChange(key)}
+            style={{
+              flex: '0 0 auto',
+              border: 'none',
+              padding: '8px 14px',
+              borderRadius: 999,
+              fontFamily: TOKENS.font,
+              fontSize: 13,
+              fontWeight: 590,
+              letterSpacing: '-0.08px',
+              cursor: 'pointer',
+              transition: 'all .2s',
+              background: active ? c.color : 'rgba(255,255,255,0.06)',
+              color: active ? '#000' : TOKENS.textDim,
+              display: 'flex', alignItems: 'center', gap: 6,
+            }}>
+            <span style={{
+              width: 6, height: 6, borderRadius: 3,
+              background: active ? '#000' : c.color,
+            }}/>
+            {c.name}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Apple Watch–style honeycomb of category bubbles.
+// Each bubble is draggable: drag onto the central button to assign
+// that category to the current session. Sized by today's mins.
+// ─────────────────────────────────────────────────────────────
+// Apple Watch–style hex layout. Returns axial positions (q, r) for n bubbles
+// arranged in concentric rings around (0,0). Center first, then ring 1
+// reordered so the cluster reads top-to-bottom (vertical bias) — top first,
+// then upper sides, lower sides, bottom; ring 2+ continues outward.
+const HEX_DIRS = [
+  [+1,  0], [+1, -1], [ 0, -1],
+  [-1,  0], [-1, +1], [ 0, +1],
+];
+// Order ring-1 hexes by visual angle so the cluster fills evenly top→bottom:
+// top, upper-right, upper-left, lower-right, lower-left, bottom
+const RING1_ORDER = [
+  { q:  0, r: -1 }, // top
+  { q:  1, r: -1 }, // upper-right
+  { q: -1, r:  0 }, // upper-left
+  { q:  1, r:  0 }, // lower-right
+  { q: -1, r:  1 }, // lower-left
+  { q:  0, r:  1 }, // bottom
+];
+function hexLayout(n) {
+  const out = [{ q: 0, r: 0 }];
+  if (n <= 1) return out.slice(0, n);
+  // ring 1
+  for (const p of RING1_ORDER) {
+    if (out.length >= n) break;
+    out.push(p);
+  }
+  // ring 2+ (standard outward walk)
+  let ring = 2;
+  while (out.length < n) {
+    let q = 0, r = -ring; // start at top of ring
+    for (let side = 0; side < 6; side++) {
+      for (let step = 0; step < ring; step++) {
+        if (out.length < n) out.push({ q, r });
+        const [dq, dr] = HEX_DIRS[(side + 2) % 6];
+        q += dq; r += dr;
+      }
+    }
+    ring++;
+  }
+  return out;
+}
+
+function HoneycombDock({
+  runningCat, elapsedSec, draggable, onAssign, dropTargetRef,
+  rising = false, // when true: bubbles "rise" toward the center button area
+  showNewTask = false, // include a "+" bubble
+  onNewTask,
+}) {
+  // minutes-per-category for today (always include every category as a bubble)
+  const totals = {};
+  Object.keys(CATS).forEach((k) => totals[k] = 0);
+  TODAY_SESSIONS.forEach((s) => totals[s.cat] += s.mins);
+  if (runningCat) totals[runningCat] = (totals[runningCat] || 0) + elapsedSec / 60;
+
+  // sort by minutes desc; first entry goes in hex center (the focal/largest)
+  const entries = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+  if (showNewTask) entries.push(['__new', -1]);
+
+  const positions = hexLayout(entries.length);
+
+  // Hex grid spacing — tight pack
+  const STEP = 56;
+  const hexX = (q, r) => STEP * (q + r / 2);
+  const hexY = (q, r) => STEP * (Math.sqrt(3) / 2) * r;
+
+  // —— Fisheye focal-point pan (Apple Watch home-screen style)
+  // The whole cluster pans under a fixed "lens" centered in the viewport.
+  // Each bubble's scale is a function of its distance to that lens center.
+  const VIEW_W = 280;   // visible window width
+  const VIEW_H = 220;   // visible window height
+  const LENS_R = 60;    // radius where bubbles are "huge"
+  const FALLOFF = 110;  // distance over which scale drops to min
+  const SCALE_MAX = 1.15;
+  const SCALE_MIN = 0.5;
+
+  // pan offset of the cluster (translates ALL bubble positions)
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const panRef = useRef({ x: 0, y: 0 });
+  panRef.current = pan;
+
+  // —— bubble drag state (drag-to-assign onto center button)
+  const [drag, setDrag] = useState(null);
+  const dragRef = useRef(null);
+
+  const onPointerDown = (k, e) => {
+    if (k === '__new') { e.stopPropagation(); onNewTask?.(); return; }
+    if (!draggable) return;
+    const phoneEl = e.currentTarget.closest('[data-phone-root]');
+    const phoneRect = phoneEl?.getBoundingClientRect() || { left: 0, top: 0 };
+    dragRef.current = {
+      k,
+      pointerId: e.pointerId,
+      startX: e.clientX, startY: e.clientY,
+      phoneEl, phoneRect,
+      isDragging: false,
+    };
+    setDrag({ k, x: e.clientX - phoneRect.left, y: e.clientY - phoneRect.top, hover: false });
+    e.stopPropagation();
+    e.preventDefault();
+    window.addEventListener('pointermove', onWindowMove);
+    window.addEventListener('pointerup', onWindowUp);
+    window.addEventListener('pointercancel', onWindowUp);
+  };
+  const onWindowMove = (e) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    const dy = e.clientY - d.startY;
+    if (!d.isDragging && Math.hypot(dx, dy) < 5) return;
+    d.isDragging = true;
+    const phoneRect = d.phoneEl?.getBoundingClientRect() || d.phoneRect;
+    const px = e.clientX - phoneRect.left;
+    const py = e.clientY - phoneRect.top;
+    let hover = false;
+    const t = dropTargetRef?.current;
+    if (t) {
+      const tr = t.getBoundingClientRect();
+      const cx = tr.left + tr.width / 2 - phoneRect.left;
+      const cy = tr.top + tr.height / 2 - phoneRect.top;
+      hover = Math.hypot(px - cx, py - cy) < tr.width / 2;
+    }
+    setDrag({ k: d.k, x: px, y: py, hover });
+  };
+  const onWindowUp = (e) => {
+    const d = dragRef.current;
+    window.removeEventListener('pointermove', onWindowMove);
+    window.removeEventListener('pointerup', onWindowUp);
+    window.removeEventListener('pointercancel', onWindowUp);
+    if (!d) { setDrag(null); return; }
+    if (d.isDragging) {
+      const phoneRect = d.phoneEl?.getBoundingClientRect() || d.phoneRect;
+      const px = e.clientX - phoneRect.left;
+      const py = e.clientY - phoneRect.top;
+      const t = dropTargetRef?.current;
+      if (t) {
+        const tr = t.getBoundingClientRect();
+        const cx = tr.left + tr.width / 2 - phoneRect.left;
+        const cy = tr.top + tr.height / 2 - phoneRect.top;
+        if (Math.hypot(px - cx, py - cy) < tr.width / 2) onAssign?.(d.k);
+      }
+    } else {
+      onAssign?.(d.k);
+    }
+    dragRef.current = null;
+    setDrag(null);
+  };
+
+  // —— Pan gesture on the lens background (drags the cluster around)
+  const panRefDrag = useRef(null);
+  const onLensPointerDown = (e) => {
+    if (e.target.closest('[data-bubble]')) return; // don't pan when grabbing a bubble
+    panRefDrag.current = {
+      startX: e.clientX, startY: e.clientY,
+      basePan: { ...panRef.current },
+    };
+    window.addEventListener('pointermove', onLensPointerMove);
+    window.addEventListener('pointerup', onLensPointerUp);
+  };
+  const onLensPointerMove = (e) => {
+    const p = panRefDrag.current;
+    if (!p) return;
+    const nx = p.basePan.x + (e.clientX - p.startX);
+    const ny = p.basePan.y + (e.clientY - p.startY);
+    setPan({ x: nx, y: ny });
+  };
+  const onLensPointerUp = () => {
+    panRefDrag.current = null;
+    window.removeEventListener('pointermove', onLensPointerMove);
+    window.removeEventListener('pointerup', onLensPointerUp);
+  };
+
+  return (
+    <div style={{
+      position: 'relative',
+      width: '100%',
+      height: rising ? 320 : VIEW_H + 20,
+      display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+      paddingTop: rising ? 0 : 4,
+      transition: 'height .45s cubic-bezier(.32,.72,.16,1)',
+    }}>
+      {/* The lens window — fixed size, centered. Bubbles pan inside it. */}
+      <div
+        onPointerDown={onLensPointerDown}
+        style={{
+          position: 'relative',
+          width: VIEW_W, height: VIEW_H,
+          overflow: 'visible',
+          touchAction: 'none',
+          cursor: panRefDrag.current ? 'grabbing' : 'default',
+          transform: `translateY(${rising ? -200 : 0}px)`,
+          transition: 'transform .55s cubic-bezier(.32,.72,.16,1)',
+        }}>
+        {entries.map(([k, m], i) => {
+          const isNew = k === '__new';
+          const c = isNew ? null : CATS[k];
+          const pos = positions[i];
+          // raw position relative to cluster origin
+          const bx = hexX(pos.q, pos.r);
+          const by = hexY(pos.q, pos.r);
+          // visual position inside the lens (origin at center of lens)
+          const vx = VIEW_W / 2 + bx + pan.x;
+          const vy = VIEW_H / 2 + by + pan.y;
+          // distance from lens center → fisheye scale
+          const dist = Math.hypot(vx - VIEW_W / 2, vy - VIEW_H / 2);
+          let scale;
+          if (dist <= LENS_R) scale = SCALE_MAX;
+          else if (dist >= LENS_R + FALLOFF) scale = SCALE_MIN;
+          else {
+            const t = (dist - LENS_R) / FALLOFF;
+            scale = SCALE_MAX + (SCALE_MIN - SCALE_MAX) * t;
+          }
+          const BUBBLE = 56;
+          const isRunning = !isNew && runningCat === k;
+          const isHidden = drag && drag.k === k;
+          // alpha based on distance (edges fade out)
+          const alpha = dist > LENS_R + FALLOFF + 30 ? 0 : 1;
+          return (
+            <button
+              key={k}
+              data-bubble
+              onPointerDown={(e) => onPointerDown(k, e)}
+              title={isNew ? 'New task' : (m > 0 ? `${c.name} · ${fmtDur(Math.round(m))}` : c.name)}
+              style={{
+                position: 'absolute',
+                left: vx - BUBBLE / 2,
+                top:  vy - BUBBLE / 2,
+                width: BUBBLE, height: BUBBLE, borderRadius: BUBBLE / 2,
+                background: isNew ? 'transparent' : c.color,
+                border: isNew ? '1.5px dashed rgba(255,255,255,0.35)' : 'none',
+                cursor: (draggable || isNew) ? 'grab' : 'default',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontFamily: TOKENS.font,
+                fontWeight: 700,
+                color: isNew ? 'rgba(255,255,255,0.7)' : '#000',
+                opacity: isHidden ? 0.15 : alpha,
+                boxShadow: isRunning
+                  ? `0 0 0 2px ${c.color}, 0 0 0 5px rgba(0,0,0,1), 0 0 0 6.5px ${c.color}80`
+                  : (isNew ? 'none' : `0 8px 20px ${c?.color}40`),
+                transform: `scale(${scale})`,
+                transformOrigin: 'center center',
+                transition: panRefDrag.current
+                  ? 'transform .04s linear, opacity .15s'
+                  : 'transform .25s cubic-bezier(.32,.72,.16,1), opacity .15s, box-shadow .2s, left .35s, top .35s',
+                touchAction: 'none',
+                userSelect: 'none',
+                WebkitUserSelect: 'none',
+                padding: 0,
+                zIndex: Math.round(scale * 100),
+              }}>
+              {isNew ? (
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                </svg>
+              ) : (
+                <div style={{ textAlign: 'center', lineHeight: 1.05, pointerEvents: 'none' }}>
+                  <div style={{
+                    fontSize: 11,
+                    fontWeight: 700, letterSpacing: '-0.2px',
+                    textTransform: 'lowercase',
+                  }}>{c.name}</div>
+                  {m > 0 && (
+                    <div style={{
+                      fontFamily: TOKENS.mono,
+                      fontSize: 9,
+                      fontWeight: 500,
+                      opacity: 0.75,
+                      marginTop: 2,
+                      fontVariantNumeric: 'tabular-nums',
+                    }}>{fmtDur(Math.round(m))}</div>
+                  )}
+                </div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Floating ghost bubble while dragging (drag-to-assign) */}
+      {drag && (() => {
+        const k = drag.k;
+        const m = totals[k] ?? 0;
+        const c = CATS[k];
+        const s = 70 * (drag.hover ? 1.15 : 1.05);
+        return (
+          <div style={{
+            position: 'absolute', left: drag.x - s / 2, top: drag.y - s / 2,
+            width: s, height: s, borderRadius: s / 2,
+            background: c.color,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: '#000', fontWeight: 700, fontSize: 12,
+            boxShadow: drag.hover
+              ? `0 0 0 4px rgba(255,255,255,0.9), 0 20px 50px ${c.color}80`
+              : `0 12px 30px ${c.color}80`,
+            pointerEvents: 'none', zIndex: 80,
+            transform: drag.hover ? 'scale(1.05)' : 'scale(1)',
+            transition: 'box-shadow .15s, transform .15s',
+            textTransform: 'lowercase',
+          }}>{c.name}</div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Timer screen
+// State machine: 'idle' | 'running' | 'holding'
+//   idle    → tap   → running
+//   running → tap   → holding (paused)
+//   holding → tap   → running
+//   holding → hold 1s → end session (Nest-lock-style ring fill)
+// Category may be null until end; if null at end, show picker.
+// ─────────────────────────────────────────────────────────────
+function TimerScreen({ phase, elapsed, category, pickPrompt, onTap, onHoldStart, onHoldCancel, onHoldComplete, onAssignCategory, onNewTask, onOpenOverview }) {
+  const running = phase === 'running';
+  const holding = phase === 'holding';
+  const cat = category ? CATS[category] : null;
+  const accent = cat?.color || '#8E8E93';
+
+  // total today + sessions
+  const totalMins = TODAY_SESSIONS.filter(s => CATS[s.cat].kind === 'work').reduce((a, s) => a + s.mins, 0)
+                  + Math.floor(elapsed / 60);
+  const distractMins = TODAY_SESSIONS.filter(s => CATS[s.cat].kind === 'distract').reduce((a, s) => a + s.mins, 0);
+  const sessionCount = TODAY_SESSIONS.length + (running || elapsed > 0 ? 1 : 0);
+
+  // ring progress (assume 4-hour goal)
+  const goalSec = 4 * 3600;
+  const todayWorkSec = totalMins * 60;
+  const ringPct = Math.min(1, todayWorkSec / goalSec);
+
+  const R = 110;
+  const C = 2 * Math.PI * R;
+
+  const dropTargetRef = useRef(null);
+
+  return (
+    <div style={{
+      height: '100%', display: 'flex', flexDirection: 'column',
+      paddingTop: 60, color: TOKENS.text, fontFamily: TOKENS.font,
+    }}>
+      {/* Top bar: brand + overview button */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '8px 24px 0',
+      }}>
+        <div style={{
+          fontFamily: TOKENS.mono, fontSize: 11, letterSpacing: '0.18em',
+          color: TOKENS.textDim, fontWeight: 500,
+        }}>LAZEELOG</div>
+        <button
+          onClick={onOpenOverview}
+          style={{
+            border: 'none', background: 'rgba(255,255,255,0.06)',
+            width: 34, height: 34, borderRadius: 17,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            cursor: 'pointer',
+          }}>
+          {Icon.grid(TOKENS.text, 16)}
+        </button>
+      </div>
+
+      {/* Timer ring — itself the play/pause button. Hold to end. */}
+      <div style={{
+        flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        position: 'relative',
+      }}>
+        <CenterButton
+          phase={phase}
+          elapsed={elapsed}
+          accent={accent}
+          category={category}
+          ringPct={ringPct}
+          onTap={onTap}
+          onHoldStart={onHoldStart}
+          onHoldCancel={onHoldCancel}
+          onHoldComplete={onHoldComplete}
+          dropTargetRef={dropTargetRef}
+        />
+      </div>
+
+      {/* Apple Watch–style honeycomb of category bubbles (today's totals) —
+          drag any bubble onto the center button to set the category.
+          When idle (after a session ends without a category), bubbles rise
+          up toward the center so the user can drop one in. */}
+      <HoneycombDock
+        runningCat={category}
+        elapsedSec={elapsed}
+        draggable={true}
+        rising={phase === 'idle' && pickPrompt}
+        showNewTask={phase === 'idle' && pickPrompt}
+        onNewTask={onNewTask}
+        onAssign={onAssignCategory}
+        dropTargetRef={dropTargetRef}
+      />
+
+      {/* Today summary strip */}
+      <div style={{
+        display: 'flex', gap: 10, padding: '0 24px 16px',
+      }}>
+        <Stat label="Focused"      value={fmtDur(totalMins)}    color={TOKENS.text}/>
+        <Stat label="Distracted"   value={fmtDur(distractMins)} color={CATS.social.color}/>
+        <Stat label="Sessions"     value={String(sessionCount)} color={TOKENS.text}/>
+      </div>
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50%      { opacity: 0.45; transform: scale(0.6); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// CenterButton — circular play/pause/hold-to-end target
+// Tap toggles running ↔ holding (paused). In holding state, press &
+// hold for 1s to end the session — a Nest-lock-style ring fills around
+// the perimeter as the hold progresses.
+// ─────────────────────────────────────────────────────────────
+function CenterButton({ phase, elapsed, accent, category, ringPct, onTap, onHoldStart, onHoldCancel, onHoldComplete, dropTargetRef }) {
+  const running = phase === 'running';
+  const holding = phase === 'holding';
+  const idle = phase === 'idle';
+  const cat = category ? CATS[category] : null;
+
+  const R = 110;
+  const C = 2 * Math.PI * R;
+  const HOLD_MS = 1000;
+
+  const [holdProgress, setHoldProgress] = useState(0); // 0..1
+  const holdRef = useRef({ raf: 0, t0: 0, active: false, didTap: false });
+
+  const startHold = (e) => {
+    if (!holding) return;
+    holdRef.current.active = true;
+    holdRef.current.didTap = false;
+    holdRef.current.t0 = performance.now();
+    onHoldStart?.();
+    const tick = () => {
+      if (!holdRef.current.active) return;
+      const t = (performance.now() - holdRef.current.t0) / HOLD_MS;
+      if (t >= 1) {
+        setHoldProgress(1);
+        holdRef.current.active = false;
+        onHoldComplete?.();
+        setTimeout(() => setHoldProgress(0), 250);
+        return;
+      }
+      setHoldProgress(t);
+      holdRef.current.raf = requestAnimationFrame(tick);
+    };
+    holdRef.current.raf = requestAnimationFrame(tick);
+  };
+  const endHold = () => {
+    if (!holdRef.current.active) return;
+    holdRef.current.active = false;
+    cancelAnimationFrame(holdRef.current.raf);
+    setHoldProgress(0);
+    onHoldCancel?.();
+  };
+
+  const onPointerDown = (e) => {
+    holdRef.current.didTap = true;
+    if (holding) startHold(e);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+  const onPointerUp = () => {
+    if (holdRef.current.active) {
+      // released early → cancel hold; treat as tap
+      endHold();
+      onTap?.();
+    } else if (!holdRef.current.didTap) {
+      // never started — ignore
+    } else {
+      // not holding state, normal tap
+      if (!holding) onTap?.();
+    }
+    holdRef.current.didTap = false;
+  };
+  const onPointerCancel = () => { endHold(); holdRef.current.didTap = false; };
+
+  // status caption
+  let caption;
+  if (idle) caption = 'tap to start';
+  else if (running) caption = cat ? `${cat.name} · tap to pause` : 'tracking · tap to pause';
+  else if (holding) caption = 'tap to resume · hold to end';
+
+  const dotColor = accent;
+
+  return (
+    <button
+      ref={dropTargetRef}
+      onPointerDown={onPointerDown}
+      onPointerUp={onPointerUp}
+      onPointerLeave={() => holdRef.current.active && endHold()}
+      onPointerCancel={onPointerCancel}
+      aria-label={caption}
+      style={{
+        width: 260, height: 260, borderRadius: 130,
+        border: 'none', background: 'transparent',
+        cursor: 'pointer', padding: 0,
+        position: 'relative', outline: 'none',
+        touchAction: 'none',
+      }}>
+      <svg width={260} height={260} style={{ position: 'absolute', inset: 0 }}>
+        {/* outer glow when running */}
+        {running && (
+          <circle cx={130} cy={130} r={R + 8} fill="none"
+            stroke={accent} strokeOpacity="0.15" strokeWidth="1"/>
+        )}
+        {/* track */}
+        <circle cx={130} cy={130} r={R} fill="none"
+          stroke="rgba(255,255,255,0.08)" strokeWidth="2.5"/>
+        {/* today's daily progress ring (subtle, behind everything) */}
+        {!holding && (
+          <circle cx={130} cy={130} r={R} fill="none"
+            stroke={accent} strokeOpacity="0.55" strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeDasharray={`${C * ringPct} ${C}`}
+            transform={`rotate(-90 130 130)`}
+            style={{ transition: 'stroke-dasharray .6s ease' }}/>
+        )}
+        {/* Hold-to-end progress ring (Nest-lock style) — overlays everything */}
+        {holding && (
+          <>
+            <circle cx={130} cy={130} r={R} fill="none"
+              stroke="rgba(255,255,255,0.12)" strokeWidth="3.5"/>
+            <circle cx={130} cy={130} r={R} fill="none"
+              stroke="#FF453A" strokeWidth="3.5"
+              strokeLinecap="round"
+              strokeDasharray={`${C * holdProgress} ${C}`}
+              transform={`rotate(-90 130 130)`}/>
+          </>
+        )}
+        {/* running pulse marker on top of progress */}
+        {running && (
+          <circle cx={130} cy={130 - R} r={4} fill={accent}>
+            <animate attributeName="opacity" values="1;0.3;1" dur="1.4s" repeatCount="indefinite"/>
+          </circle>
+        )}
+        {/* inner subtle fill that intensifies on running */}
+        <circle cx={130} cy={130} r={R - 6}
+          fill={running ? `${accent}10` : holding ? 'rgba(255,69,58,0.06)' : 'rgba(255,255,255,0.02)'}
+          style={{ transition: 'fill .3s' }}/>
+      </svg>
+
+      <div style={{
+        position: 'absolute', inset: 0,
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+        pointerEvents: 'none',
+      }}>
+        <div style={{
+          fontFamily: TOKENS.mono, fontWeight: 200,
+          fontSize: 48, letterSpacing: '-0.02em',
+          fontVariantNumeric: 'tabular-nums',
+          lineHeight: 1, color: TOKENS.text,
+        }}>
+          {fmtClock(elapsed)}
+        </div>
+        <div style={{
+          marginTop: 12, fontSize: 12, color: holding ? '#FF6961' : TOKENS.textDim,
+          display: 'flex', alignItems: 'center', gap: 6,
+          letterSpacing: '0.02em',
+          textAlign: 'center',
+        }}>
+          {running && (
+            <span style={{
+              width: 6, height: 6, borderRadius: 3, background: dotColor,
+              animation: 'pulse 1.6s ease-in-out infinite',
+            }}/>
+          )}
+          {caption}
+        </div>
+        {idle && (
+          <div style={{
+            marginTop: 8, fontSize: 11,
+            fontFamily: TOKENS.mono, color: TOKENS.textFaint,
+            letterSpacing: '0.1em', textTransform: 'uppercase',
+          }}>no task</div>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function Stat({ label, value, color }) {
+  return (
+    <div style={{
+      flex: 1, padding: '12px 14px',
+      background: 'rgba(255,255,255,0.04)',
+      borderRadius: 14,
+      border: '1px solid rgba(255,255,255,0.06)',
+    }}>
+      <div style={{
+        fontSize: 11, color: TOKENS.textDim, fontWeight: 500,
+        letterSpacing: '-0.05px', marginBottom: 4,
+      }}>{label}</div>
+      <div style={{
+        fontSize: 20, fontWeight: 600, color, letterSpacing: '-0.4px',
+        fontVariantNumeric: 'tabular-nums',
+      }}>{value}</div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// History bottom sheet (drag from bottom)
+// ─────────────────────────────────────────────────────────────
+function HistorySheet({ open, height, onHeightChange, onClose }) {
+  const sheetRef = useRef(null);
+  const dragRef = useRef({ startY: 0, startH: 0, dragging: false });
+
+  // device height (we know IOSDevice is 844)
+  const DEV_H = 844;
+  const PEEK = 120;
+  const HALF = 480;
+  const FULL = DEV_H - 60;
+
+  const onPointerDown = (e) => {
+    dragRef.current = {
+      startY: e.clientY ?? e.touches?.[0]?.clientY,
+      startH: height,
+      dragging: true,
+    };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+  const onPointerMove = (e) => {
+    if (!dragRef.current.dragging) return;
+    const y = e.clientY ?? e.touches?.[0]?.clientY;
+    const dy = dragRef.current.startY - y;
+    const next = Math.max(PEEK, Math.min(FULL, dragRef.current.startH + dy));
+    onHeightChange(next);
+  };
+  const onPointerUp = () => {
+    if (!dragRef.current.dragging) return;
+    dragRef.current.dragging = false;
+    // snap
+    const h = height;
+    const closer = [PEEK, HALF, FULL].reduce((a, b) =>
+      Math.abs(b - h) < Math.abs(a - h) ? b : a
+    );
+    onHeightChange(closer);
+  };
+
+  // group sessions by hour for timeline view
+  const sessions = TODAY_SESSIONS;
+  const totalToday = sessions.reduce((a, s) => a + s.mins, 0);
+
+  return (
+    <div
+      ref={sheetRef}
+      style={{
+        position: 'absolute', left: 0, right: 0, bottom: 0,
+        height,
+        background: 'rgba(20,20,22,0.92)',
+        backdropFilter: 'blur(40px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(40px) saturate(180%)',
+        borderTopLeftRadius: 28, borderTopRightRadius: 28,
+        borderTop: '1px solid rgba(255,255,255,0.08)',
+        boxShadow: '0 -20px 60px rgba(0,0,0,0.5)',
+        transition: dragRef.current.dragging ? 'none' : 'height .35s cubic-bezier(.32,.72,.16,1)',
+        zIndex: 30,
+        display: 'flex', flexDirection: 'column',
+        overflow: 'hidden',
+      }}>
+      {/* Drag handle area */}
+      <div
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        style={{
+          padding: '10px 0 6px',
+          display: 'flex', flexDirection: 'column', alignItems: 'center',
+          touchAction: 'none', cursor: 'grab',
+          flexShrink: 0,
+        }}>
+        <div style={{
+          width: 36, height: 5, borderRadius: 3,
+          background: 'rgba(255,255,255,0.3)',
+        }}/>
+      </div>
+
+      {/* Header */}
+      <div style={{
+        padding: '6px 24px 14px',
+        display: 'flex', justifyContent: 'space-between', alignItems: 'baseline',
+        flexShrink: 0,
+      }}>
+        <div>
+          <div style={{
+            fontSize: 22, fontWeight: 700, color: TOKENS.text,
+            letterSpacing: '-0.5px',
+          }}>Today</div>
+          <div style={{
+            fontSize: 13, color: TOKENS.textDim, marginTop: 2,
+          }}>{sessions.length} sessions · {fmtDur(totalToday)}</div>
+        </div>
+        <div style={{
+          fontFamily: TOKENS.mono, fontSize: 11, color: TOKENS.textFaint,
+          letterSpacing: '0.1em',
+        }}>APR 27</div>
+      </div>
+
+      {/* Stacked bar */}
+      <div style={{ padding: '0 24px 16px', flexShrink: 0 }}>
+        <StackedBar sessions={sessions}/>
+      </div>
+
+      {/* Session list */}
+      <div style={{
+        flex: 1, overflowY: 'auto', padding: '0 16px 80px',
+        WebkitOverflowScrolling: 'touch',
+      }}>
+        {sessions.slice().reverse().map((s) => (
+          <SessionRow key={s.id} session={s}/>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StackedBar({ sessions }) {
+  const total = sessions.reduce((a, s) => a + s.mins, 0);
+  return (
+    <div style={{
+      height: 18, borderRadius: 9, overflow: 'hidden',
+      background: 'rgba(255,255,255,0.06)',
+      display: 'flex', gap: 1.5,
+      border: '0.5px solid rgba(255,255,255,0.04)',
+    }}>
+      {sessions.map((s) => (
+        <div key={s.id} style={{
+          width: `${(s.mins / total) * 100}%`,
+          background: CATS[s.cat].color,
+        }}/>
+      ))}
+    </div>
+  );
+}
+
+function SessionRow({ session }) {
+  const c = CATS[session.cat];
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 14,
+      padding: '14px 12px',
+      borderBottom: '1px solid rgba(255,255,255,0.04)',
+    }}>
+      <div style={{
+        width: 38, height: 38, borderRadius: 10,
+        background: `${c.color}22`,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        position: 'relative',
+      }}>
+        <div style={{
+          width: 8, height: 8, borderRadius: 4, background: c.color,
+        }}/>
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{
+          fontSize: 15, fontWeight: 590, color: TOKENS.text,
+          letterSpacing: '-0.2px',
+        }}>{session.label}</div>
+        <div style={{
+          fontSize: 12, color: TOKENS.textDim, marginTop: 1,
+        }}>{c.name} · {session.start}</div>
+      </div>
+      <div style={{
+        fontFamily: TOKENS.mono, fontSize: 14, fontWeight: 500,
+        color: TOKENS.text, fontVariantNumeric: 'tabular-nums',
+      }}>{fmtDur(session.mins)}</div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Overview screen (Habit / GitHub-grass style with category colors)
+// ─────────────────────────────────────────────────────────────
+function OverviewScreen({ onBack }) {
+  const [selectedCat, setSelectedCat] = useState('all');
+
+  // Compute totals per day for the selected category (or all work cats)
+  const dayTotals = HISTORY.map((d) => {
+    if (selectedCat === 'all') {
+      // sum of work categories only
+      let total = 0;
+      const breakdown = {};
+      Object.entries(d.sessions).forEach(([k, m]) => {
+        if (CATS[k].kind === 'work') total += m;
+        breakdown[k] = m;
+      });
+      return { ...d, total, breakdown };
+    }
+    const m = d.sessions[selectedCat] || 0;
+    return { ...d, total: m, breakdown: { [selectedCat]: m } };
+  });
+
+  // Stats
+  const total7  = dayTotals.slice(-7).reduce((a, d) => a + d.total, 0);
+  const total30 = dayTotals.slice(-30).reduce((a, d) => a + d.total, 0);
+  const streak = (() => {
+    let s = 0;
+    for (let i = dayTotals.length - 1; i >= 0; i--) {
+      if (dayTotals[i].total > 0) s++;
+      else break;
+    }
+    return s;
+  })();
+
+  return (
+    <div style={{
+      height: '100%', overflowY: 'auto',
+      background: TOKENS.bg, color: TOKENS.text, fontFamily: TOKENS.font,
+      paddingTop: 60,
+    }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '8px 24px 16px',
+      }}>
+        <div>
+          <div style={{
+            fontFamily: TOKENS.mono, fontSize: 11, letterSpacing: '0.18em',
+            color: TOKENS.textDim, fontWeight: 500,
+          }}>OVERVIEW</div>
+          <div style={{
+            fontSize: 28, fontWeight: 700, letterSpacing: '-0.7px',
+            marginTop: 2,
+          }}>Last 13 weeks</div>
+        </div>
+        <button
+          onClick={onBack}
+          style={{
+            border: 'none', background: 'rgba(255,255,255,0.06)',
+            width: 34, height: 34, borderRadius: 17, cursor: 'pointer',
+            color: TOKENS.text,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+          {Icon.chevDown(TOKENS.text, 16)}
+        </button>
+      </div>
+
+      {/* Stats row */}
+      <div style={{
+        display: 'flex', gap: 10, padding: '0 24px 20px',
+      }}>
+        <Stat label="7-day"   value={fmtDur(total7)} color={TOKENS.text}/>
+        <Stat label="30-day"  value={fmtDur(total30)} color={TOKENS.text}/>
+        <Stat label="Streak"  value={`${streak}d`} color="#30D158"/>
+      </div>
+
+      {/* Filter pills */}
+      <div style={{ marginBottom: 18 }}>
+        <div style={{
+          display: 'flex', gap: 8, overflowX: 'auto', padding: '0 24px',
+          scrollbarWidth: 'none',
+        }}>
+          <FilterPill active={selectedCat === 'all'} onClick={() => setSelectedCat('all')}>
+            All work
+          </FilterPill>
+          {Object.entries(CATS).filter(([, c]) => c.kind === 'work').map(([k, c]) => (
+            <FilterPill key={k} active={selectedCat === k} color={c.color} onClick={() => setSelectedCat(k)}>
+              {c.name}
+            </FilterPill>
+          ))}
+        </div>
+      </div>
+
+      {/* Grass grid */}
+      <div style={{ padding: '0 24px 24px' }}>
+        <GrassGrid days={dayTotals} selectedCat={selectedCat}/>
+      </div>
+
+      {/* Category breakdown bars */}
+      <div style={{ padding: '0 24px 40px' }}>
+        <div style={{
+          fontSize: 13, fontWeight: 590, color: TOKENS.textDim,
+          marginBottom: 14, letterSpacing: '-0.1px',
+        }}>This week</div>
+        <CategoryBreakdown days={HISTORY.slice(-7)}/>
+      </div>
+    </div>
+  );
+}
+
+function FilterPill({ active, color = TOKENS.text, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        flex: '0 0 auto', border: 'none',
+        padding: '7px 13px', borderRadius: 999,
+        fontFamily: TOKENS.font, fontSize: 13, fontWeight: 590,
+        cursor: 'pointer', transition: 'all .2s',
+        background: active ? color : 'rgba(255,255,255,0.06)',
+        color: active ? '#000' : TOKENS.textDim,
+        display: 'flex', alignItems: 'center', gap: 6,
+      }}>
+      {children}
+    </button>
+  );
+}
+
+function GrassGrid({ days, selectedCat }) {
+  // 13 weeks × 7 days. Days array is 91 long, oldest first.
+  // We render columns = weeks, rows = day-of-week.
+  // For colored cells in 'all' mode, blend the dominant category's color.
+  const weeks = [];
+  for (let w = 0; w < 13; w++) {
+    weeks.push(days.slice(w * 7, w * 7 + 7));
+  }
+
+  const maxMins = Math.max(...days.map((d) => d.total), 60);
+
+  const cellFor = (d) => {
+    if (!d) return null;
+    if (d.total === 0) {
+      return { bg: 'rgba(255,255,255,0.04)', label: '0m' };
+    }
+    // Pick dominant cat
+    let domCat = selectedCat === 'all'
+      ? Object.entries(d.breakdown).filter(([k]) => CATS[k]?.kind === 'work')
+          .sort((a, b) => b[1] - a[1])[0]?.[0]
+      : selectedCat;
+    if (!domCat) return { bg: 'rgba(255,255,255,0.04)', label: '0m' };
+    const intensity = Math.min(1, d.total / maxMins);
+    // 4-step intensity like GitHub
+    const opacity = intensity < 0.25 ? 0.25
+                  : intensity < 0.5  ? 0.45
+                  : intensity < 0.75 ? 0.7
+                  : 1;
+    return {
+      bg: hexA(CATS[domCat].color, opacity),
+      label: `${fmtDur(d.total)}`,
+    };
+  };
+
+  const dayLabels = ['', 'M', '', 'W', '', 'F', ''];
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        {/* day-of-week labels */}
+        <div style={{
+          display: 'flex', flexDirection: 'column', gap: 5,
+          paddingTop: 18,
+        }}>
+          {dayLabels.map((l, i) => (
+            <div key={i} style={{
+              height: 22, fontSize: 9, color: TOKENS.textFaint,
+              fontFamily: TOKENS.mono, lineHeight: '22px',
+              fontWeight: 500,
+            }}>{l}</div>
+          ))}
+        </div>
+        {/* weeks */}
+        <div style={{ flex: 1, overflowX: 'auto', scrollbarWidth: 'none' }}>
+          <div style={{ display: 'flex', gap: 5, minWidth: 'fit-content' }}>
+            {weeks.map((wk, wi) => {
+              const isMonthStart = wk[0] && wk[0].date.getDate() <= 7;
+              return (
+                <div key={wi} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <div style={{
+                    height: 14, fontSize: 9, color: TOKENS.textFaint,
+                    fontFamily: TOKENS.mono, fontWeight: 500,
+                  }}>
+                    {isMonthStart && wk[0]
+                      ? wk[0].date.toLocaleDateString('en', { month: 'short' }).toUpperCase()
+                      : ''}
+                  </div>
+                  {wk.map((d, di) => {
+                    const c = cellFor(d);
+                    if (!c) return <div key={di} style={{ width: 22, height: 22 }}/>;
+                    return (
+                      <div
+                        key={di}
+                        title={`${d.date.toLocaleDateString()}: ${c.label}`}
+                        style={{
+                          width: 22, height: 22, borderRadius: 5,
+                          background: c.bg,
+                          border: '0.5px solid rgba(255,255,255,0.04)',
+                        }}/>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* Legend */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'flex-end',
+        marginTop: 12, fontSize: 10, color: TOKENS.textFaint,
+        fontFamily: TOKENS.mono, fontWeight: 500,
+      }}>
+        Less
+        <div style={{ width: 12, height: 12, borderRadius: 3, background: 'rgba(255,255,255,0.04)' }}/>
+        <div style={{ width: 12, height: 12, borderRadius: 3, background: hexA(selectedCat === 'all' ? '#30D158' : CATS[selectedCat]?.color || '#30D158', 0.25) }}/>
+        <div style={{ width: 12, height: 12, borderRadius: 3, background: hexA(selectedCat === 'all' ? '#30D158' : CATS[selectedCat]?.color || '#30D158', 0.5) }}/>
+        <div style={{ width: 12, height: 12, borderRadius: 3, background: hexA(selectedCat === 'all' ? '#30D158' : CATS[selectedCat]?.color || '#30D158', 0.75) }}/>
+        <div style={{ width: 12, height: 12, borderRadius: 3, background: hexA(selectedCat === 'all' ? '#30D158' : CATS[selectedCat]?.color || '#30D158', 1) }}/>
+        More
+      </div>
+    </div>
+  );
+}
+
+function CategoryBreakdown({ days }) {
+  // Aggregate minutes per category over the given days
+  const totals = {};
+  Object.keys(CATS).forEach((k) => totals[k] = 0);
+  days.forEach((d) => {
+    Object.entries(d.sessions).forEach(([k, m]) => totals[k] += m);
+  });
+  const grandTotal = Object.values(totals).reduce((a, b) => a + b, 0) || 1;
+  const entries = Object.entries(totals)
+    .filter(([, m]) => m > 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {entries.map(([k, m]) => {
+        const c = CATS[k];
+        const pct = (m / grandTotal) * 100;
+        return (
+          <div key={k}>
+            <div style={{
+              display: 'flex', justifyContent: 'space-between',
+              fontSize: 13, marginBottom: 6,
+            }}>
+              <span style={{
+                color: TOKENS.text, fontWeight: 500,
+                display: 'flex', alignItems: 'center', gap: 8,
+              }}>
+                <span style={{
+                  width: 8, height: 8, borderRadius: 4, background: c.color,
+                }}/>
+                {c.name}
+                {c.kind === 'distract' && (
+                  <span style={{
+                    fontSize: 10, padding: '2px 6px', borderRadius: 4,
+                    background: 'rgba(255,69,58,0.15)', color: '#FF6961',
+                    fontWeight: 590,
+                  }}>distract</span>
+                )}
+              </span>
+              <span style={{
+                fontFamily: TOKENS.mono, color: TOKENS.textDim,
+                fontVariantNumeric: 'tabular-nums',
+              }}>{fmtDur(m)}</span>
+            </div>
+            <div style={{
+              height: 6, borderRadius: 3,
+              background: 'rgba(255,255,255,0.05)',
+              overflow: 'hidden',
+            }}>
+              <div style={{
+                width: `${pct}%`, height: '100%',
+                background: c.color,
+                borderRadius: 3,
+                transition: 'width .6s',
+              }}/>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// hex + alpha helper
+function hexA(hex, a) {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Root app
+// ─────────────────────────────────────────────────────────────
+function LazeeLogApp({ initialView = 'timer', initialPhase = 'idle', initialElapsed = 0, initialCategory = null, sheetHeight: initSheet = 0 }) {
+  const [view, setView] = useState(initialView); // 'timer' | 'overview'
+  const [phase, setPhase] = useState(initialPhase); // 'idle' | 'running' | 'holding'
+  const [elapsed, setElapsed] = useState(initialElapsed);
+  const [category, setCategory] = useState(initialCategory); // null until assigned
+  const [sheetHeight, setSheetHeight] = useState(initSheet); // 0 closed, 120 peek, 480 half, 800ish full
+  const [pickPrompt, setPickPrompt] = useState(false); // bubbles rise to prompt category pick
+  const [pendingElapsed, setPendingElapsed] = useState(0);
+  const [newTaskOpen, setNewTaskOpen] = useState(false);
+
+  // tick
+  useEffect(() => {
+    if (phase !== 'running') return;
+    const i = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(i);
+  }, [phase]);
+
+  // Center button tap: idle→running, running→holding, holding→running
+  const onCenterTap = () => {
+    if (phase === 'idle') setPhase('running');
+    else if (phase === 'running') setPhase('holding');
+    else if (phase === 'holding') setPhase('running');
+  };
+  const onHoldComplete = () => {
+    // end session
+    if (!category) {
+      setPendingElapsed(elapsed);
+      setPickPrompt(true);
+    }
+    setPhase('idle');
+    setElapsed(0);
+  };
+  const onAssignCategory = (catId) => {
+    setCategory(catId);
+    setPickPrompt(false);
+    setPendingElapsed(0);
+  };
+  const onNewTask = () => setNewTaskOpen(true);
+
+  // Allow swipe-up gesture from timer screen bottom edge to open history
+  const startTouch = useRef(null);
+  const onTouchStart = (e) => {
+    const t = e.touches[0];
+    if (t.clientY > 700) startTouch.current = { y: t.clientY };
+  };
+  const onTouchMove = (e) => {
+    if (!startTouch.current) return;
+    const t = e.touches[0];
+    const dy = startTouch.current.y - t.clientY;
+    if (dy > 0) setSheetHeight(Math.min(800, dy + 60));
+  };
+  const onTouchEnd = () => {
+    if (!startTouch.current) return;
+    startTouch.current = null;
+    if (sheetHeight > 240) setSheetHeight(480);
+    else if (sheetHeight > 60) setSheetHeight(120);
+    else setSheetHeight(0);
+  };
+
+  return (
+    <div
+      data-phone-root="true"
+      style={{ position: 'relative', height: '100%', overflow: 'hidden', background: TOKENS.bg }}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+      {view === 'timer' ? (
+        <TimerScreen
+          phase={phase} elapsed={elapsed}
+          category={category}
+          pickPrompt={pickPrompt}
+          onTap={onCenterTap}
+          onHoldStart={() => {}}
+          onHoldCancel={() => {}}
+          onHoldComplete={onHoldComplete}
+          onAssignCategory={onAssignCategory}
+          onNewTask={onNewTask}
+          onOpenOverview={() => setView('overview')}
+        />
+      ) : (
+        <OverviewScreen onBack={() => setView('timer')}/>
+      )}
+
+      {newTaskOpen && (
+        <NewTaskDialog
+          elapsed={pendingElapsed}
+          onCreate={() => { setNewTaskOpen(false); setPickPrompt(false); setPendingElapsed(0); }}
+          onDismiss={() => setNewTaskOpen(false)}
+        />
+      )}
+
+      {/* Edge hint when sheet is closed */}
+      {sheetHeight === 0 && view === 'timer' && (
+        <button
+          onClick={() => setSheetHeight(480)}
+          style={{
+            position: 'absolute', bottom: 18, left: '50%', transform: 'translateX(-50%)',
+            border: 'none', background: 'transparent', cursor: 'pointer',
+            color: TOKENS.textFaint, fontSize: 11, fontFamily: TOKENS.mono,
+            letterSpacing: '0.1em', display: 'flex', alignItems: 'center', gap: 6,
+            zIndex: 5,
+          }}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+            <path d="M6 15l6-6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+          HISTORY
+        </button>
+      )}
+
+      {sheetHeight > 0 && view === 'timer' && (
+        <HistorySheet
+          open={true}
+          height={sheetHeight}
+          onHeightChange={(h) => {
+            if (h < 60) setSheetHeight(0);
+            else setSheetHeight(h);
+          }}
+          onClose={() => setSheetHeight(0)}
+        />
+      )}
+
+      {/* Backdrop tap to dismiss when expanded */}
+      {sheetHeight > 200 && (
+        <div
+          onClick={() => setSheetHeight(0)}
+          style={{
+            position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)',
+            zIndex: 25, transition: 'opacity .3s',
+          }}/>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Category picker dialog — shown after ending a session with no category.
+// ─────────────────────────────────────────────────────────────
+function NewTaskDialog({ elapsed, onCreate, onDismiss }) {
+  const [name, setName] = useState('');
+  return (
+    <div onClick={onDismiss} style={{
+      position: 'absolute', inset: 0, zIndex: 90,
+      background: 'rgba(0,0,0,0.55)',
+      backdropFilter: 'blur(20px) saturate(180%)',
+      WebkitBackdropFilter: 'blur(20px) saturate(180%)',
+      display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+      padding: 16, paddingBottom: 24,
+      animation: 'fadeIn .25s ease',
+    }}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        width: '100%', maxWidth: 360,
+        background: 'rgba(28,28,30,0.96)',
+        border: '1px solid rgba(255,255,255,0.08)',
+        borderRadius: 22,
+        padding: '18px 18px 14px',
+        color: TOKENS.text, fontFamily: TOKENS.font,
+        boxShadow: '0 30px 80px rgba(0,0,0,0.6)',
+        animation: 'slideUp .35s cubic-bezier(.32,.72,.16,1)',
+      }}>
+        <div style={{ fontSize: 11, color: TOKENS.textFaint, fontFamily: TOKENS.mono,
+                      letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 4 }}>
+          {elapsed > 0 ? `Session · ${fmtDur(Math.max(1, Math.round(elapsed / 60)))}` : 'New task'}
+        </div>
+        <div style={{ fontSize: 18, fontWeight: 600, letterSpacing: '-0.3px', marginBottom: 12 }}>
+          Name this task
+        </div>
+        <input autoFocus value={name} onChange={(e) => setName(e.target.value)}
+          placeholder="Task name"
+          style={{
+            width: '100%', padding: '14px 14px',
+            background: 'rgba(255,255,255,0.06)',
+            border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 14,
+            color: TOKENS.text, fontFamily: TOKENS.font,
+            fontSize: 16, outline: 'none', boxSizing: 'border-box',
+          }}/>
+        <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+          <button onClick={onDismiss} style={{
+            flex: 1, padding: '12px', background: 'rgba(255,255,255,0.04)',
+            border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12,
+            color: TOKENS.textDim, fontFamily: TOKENS.font, fontSize: 14,
+            cursor: 'pointer',
+          }}>Cancel</button>
+          <button onClick={() => name.trim() && onCreate(name.trim())} disabled={!name.trim()}
+            style={{
+              flex: 2, padding: '12px',
+              background: name.trim() ? '#fff' : 'rgba(255,255,255,0.1)',
+              border: 'none', borderRadius: 12,
+              color: name.trim() ? '#000' : TOKENS.textFaint,
+              fontFamily: TOKENS.font, fontSize: 14, fontWeight: 600,
+              cursor: name.trim() ? 'pointer' : 'default',
+            }}>Save</button>
+        </div>
+      </div>
+      <style>{`
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { transform: translateY(40px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+      `}</style>
+    </div>
+  );
+}
+
+function CategoryPickerDialog({ elapsed, onChoose, onDismiss }) {
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState('');
+  const cats = Object.entries(CATS);
+
+  return (
+    <div
+      onClick={onDismiss}
+      style={{
+        position: 'absolute', inset: 0, zIndex: 90,
+        background: 'rgba(0,0,0,0.55)',
+        backdropFilter: 'blur(20px) saturate(180%)',
+        WebkitBackdropFilter: 'blur(20px) saturate(180%)',
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'center',
+        padding: 16, paddingBottom: 24,
+        animation: 'fadeIn .25s ease',
+      }}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: '100%', maxWidth: 360,
+          background: 'rgba(28,28,30,0.96)',
+          border: '1px solid rgba(255,255,255,0.08)',
+          borderRadius: 22,
+          padding: '18px 18px 14px',
+          color: TOKENS.text,
+          fontFamily: TOKENS.font,
+          boxShadow: '0 30px 80px rgba(0,0,0,0.6)',
+          animation: 'slideUp .35s cubic-bezier(.32,.72,.16,1)',
+        }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 10 }}>
+          <div>
+            <div style={{ fontSize: 11, color: TOKENS.textFaint, fontFamily: TOKENS.mono,
+                          letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 4 }}>
+              Session ended · {fmtDur(Math.max(1, Math.round(elapsed / 60)))}
+            </div>
+            <div style={{ fontSize: 18, fontWeight: 600, letterSpacing: '-0.3px' }}>
+              What were you working on?
+            </div>
+          </div>
+          <button onClick={onDismiss} style={{
+            border: 'none', background: 'transparent', color: TOKENS.textDim,
+            cursor: 'pointer', fontSize: 13, padding: 4,
+          }}>Skip</button>
+        </div>
+
+        {!creating && (
+          <>
+            <div style={{
+              display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8,
+              marginTop: 8,
+            }}>
+              {cats.map(([k, c]) => (
+                <button key={k}
+                  onClick={() => onChoose(k)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '12px 12px',
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                    borderRadius: 14,
+                    color: TOKENS.text, fontFamily: TOKENS.font,
+                    fontSize: 14, fontWeight: 500,
+                    cursor: 'pointer', textAlign: 'left',
+                  }}>
+                  <span style={{
+                    width: 14, height: 14, borderRadius: 7, background: c.color,
+                    flexShrink: 0,
+                  }}/>
+                  {c.name}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setCreating(true)}
+              style={{
+                marginTop: 10, width: '100%',
+                padding: '12px',
+                background: 'transparent',
+                border: '1px dashed rgba(255,255,255,0.18)',
+                borderRadius: 14,
+                color: TOKENS.textDim, fontFamily: TOKENS.font,
+                fontSize: 13, fontWeight: 500,
+                cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+              </svg>
+              New task
+            </button>
+          </>
+        )}
+
+        {creating && (
+          <div style={{ marginTop: 8 }}>
+            <input
+              autoFocus
+              value={newName}
+              onChange={(e) => setNewName(e.target.value)}
+              placeholder="Task name"
+              style={{
+                width: '100%', padding: '14px 14px',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.1)',
+                borderRadius: 14,
+                color: TOKENS.text, fontFamily: TOKENS.font,
+                fontSize: 16, outline: 'none',
+                boxSizing: 'border-box',
+              }}/>
+            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+              <button onClick={() => setCreating(false)} style={{
+                flex: 1, padding: '12px', background: 'rgba(255,255,255,0.04)',
+                border: '1px solid rgba(255,255,255,0.08)', borderRadius: 12,
+                color: TOKENS.textDim, fontFamily: TOKENS.font, fontSize: 14,
+                cursor: 'pointer',
+              }}>Back</button>
+              <button
+                onClick={() => onChoose('code')}
+                disabled={!newName.trim()}
+                style={{
+                  flex: 2, padding: '12px',
+                  background: newName.trim() ? '#fff' : 'rgba(255,255,255,0.1)',
+                  border: 'none', borderRadius: 12,
+                  color: newName.trim() ? '#000' : TOKENS.textFaint,
+                  fontFamily: TOKENS.font, fontSize: 14, fontWeight: 600,
+                  cursor: newName.trim() ? 'pointer' : 'default',
+                }}>Save & log</button>
+            </div>
+          </div>
+        )}
+      </div>
+      <style>{`
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideUp { from { transform: translateY(40px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+      `}</style>
+    </div>
+  );
+}
+
+window.LazeeLogApp = LazeeLogApp;
+window.LAZEELOG_TOKENS = TOKENS;
+window.LAZEELOG_CATS = CATS;
+
+// ─────────────────────────────────────────────────────────────
+// Bootstrap canvas (runs after all other scripts have defined their globals)
+// ─────────────────────────────────────────────────────────────
+function Phone({ initialView = 'timer', initialPhase = 'idle', initialElapsed = 0, initialCategory = null, sheetHeight = 0 }) {
+  return (
+    <IOSDevice width={390} height={844} dark={true}>
+      <LazeeLogApp
+        initialView={initialView}
+        initialPhase={initialPhase}
+        initialElapsed={initialElapsed}
+        initialCategory={initialCategory}
+        sheetHeight={sheetHeight}/>
+    </IOSDevice>
+  );
+}
+
+function CanvasRoot() {
+  return (
+    <DesignCanvas title="LazeeLog · Apple-flavored time tracking" subtitle="Dark · SF Pro · category-coded · GitHub-grass overview">
+      <DCSection id="flow" title="Core flow" subtitle="Idle → tracking → history sheet">
+        <DCArtboard id="idle" label="01 · Idle (no task)" width={390} height={844}>
+          <Phone initialView="timer" initialPhase="idle" initialElapsed={0} sheetHeight={0}/>
+        </DCArtboard>
+        <DCArtboard id="running" label="02 · Tracking" width={390} height={844}>
+          <Phone initialView="timer" initialPhase="running" initialElapsed={1842} initialCategory="code" sheetHeight={0}/>
+        </DCArtboard>
+        <DCArtboard id="holding" label="03 · Paused (hold to end)" width={390} height={844}>
+          <Phone initialView="timer" initialPhase="holding" initialElapsed={1842} initialCategory="code" sheetHeight={0}/>
+        </DCArtboard>
+        <DCArtboard id="peek" label="04 · History · peek" width={390} height={844}>
+          <Phone initialView="timer" initialPhase="idle" initialElapsed={0} sheetHeight={140}/>
+        </DCArtboard>
+        <DCArtboard id="half" label="05 · History · half" width={390} height={844}>
+          <Phone initialView="timer" initialPhase="idle" initialElapsed={0} sheetHeight={480}/>
+        </DCArtboard>
+        <DCArtboard id="full" label="06 · History · full" width={390} height={844}>
+          <Phone initialView="timer" initialPhase="idle" initialElapsed={0} sheetHeight={780}/>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="overview" title="Overview · Habit-style dashboard" subtitle="GitHub-grass with per-category color coding">
+        <DCArtboard id="overview-all" label="06 · All work" width={390} height={844}>
+          <Phone initialView="overview"/>
+        </DCArtboard>
+      </DCSection>
+
+      <DCSection id="live" title="Live prototype" subtitle="Tap play. Drag handle up. Try the grid icon. Pick a category.">
+        <DCArtboard id="live-app" label="Try it" width={390} height={844}>
+          <Phone initialView="timer"/>
+        </DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<CanvasRoot/>);
