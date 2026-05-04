@@ -29,9 +29,7 @@ final class TimerViewModel: ObservableObject {
     init() {
         timer = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
-            .sink { [weak self] now in
-                self?.tick(now)
-            }
+            .sink { [weak self] now in self?.tick(now) }
     }
 
     func onMainTap() {
@@ -47,18 +45,22 @@ final class TimerViewModel: ObservableObject {
     }
 
     func startHold() {
-        guard state == .holding else { return }
-        if holdTimer != nil { return }
+        guard state == .holding, holdTimer == nil else { return }
         holdStartedAt = Date()
-        holdTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
             guard let self, let start = self.holdStartedAt else { return }
-            let progress = min(Date().timeIntervalSince(start), 1.0)
+            let progress = min(Date().timeIntervalSince(start) / 1.0, 1.0)
             self.holdProgress = progress
-            if progress >= 1.0 {
+            if progress >= 1 {
                 timer.invalidate()
                 self.endSession()
             }
         }
+    }
+
+    func releaseHold() {
+        guard state == .holding else { return }
+        if holdProgress < 1 { cancelHold() }
     }
 
     func cancelHold() {
@@ -83,16 +85,7 @@ final class TimerViewModel: ObservableObject {
         let ended = Date()
         let label = category(by: selectedCategoryId)?.name ?? "task"
 
-        sessions.insert(
-            Session(
-                id: UUID(),
-                categoryId: selectedCategoryId,
-                label: label,
-                startedAt: start,
-                endedAt: ended
-            ),
-            at: 0
-        )
+        sessions.insert(Session(id: UUID(), categoryId: selectedCategoryId, label: label, startedAt: start, endedAt: ended), at: 0)
 
         state = .idle
         elapsedSec = 0

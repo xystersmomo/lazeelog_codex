@@ -15,7 +15,7 @@ struct TrackButton: View {
     let holdProgress: Double
     let onTap: () -> Void
     let onHoldStart: () -> Void
-    let onHoldCancel: () -> Void
+    let onHoldEnd: () -> Void
 
     var body: some View {
         ZStack {
@@ -25,15 +25,15 @@ struct TrackButton: View {
 
             Circle()
                 .trim(from: 0, to: holdProgress)
-                .stroke(Theme.Colors.danger, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                .stroke(Theme.Colors.danger, style: StrokeStyle(lineWidth: 8, lineCap: .round))
                 .rotationEffect(.degrees(-90))
-                .frame(width: 250, height: 250)
+                .frame(width: 256, height: 256)
+                .animation(.linear(duration: 0.05), value: holdProgress)
 
             VStack(spacing: 8) {
                 Text(label)
                     .foregroundStyle(Theme.Colors.text)
                     .font(.system(size: 34, weight: .semibold, design: .monospaced))
-
                 Text(subLabel)
                     .foregroundStyle(Theme.Colors.textDim)
                     .font(.system(size: 13, weight: .medium))
@@ -41,10 +41,10 @@ struct TrackButton: View {
         }
         .contentShape(Circle())
         .onTapGesture(perform: onTap)
-        .gesture(
-            LongPressGesture(minimumDuration: 0)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
                 .onChanged { _ in onHoldStart() }
-                .onEnded { _ in onHoldCancel() }
+                .onEnded { _ in onHoldEnd() }
         )
     }
 }
